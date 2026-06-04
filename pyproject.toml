@@ -1,0 +1,43 @@
+[project]
+name = "attnhut"
+description = "Implementation of various Transformer Attention mechanisms proposed by frontier LLM labs."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Emmanuel G. Maminta", email = "egmaminta@up.edu.ph" }]
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["attention", "transformer", "sparse-attention", "pytorch"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dynamic = ["version"]
+dependencies = [
+    "torch>=2.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/egmaminta/attnhut"
+Repository = "https://github.com/egmaminta/attnhut"
+Issues = "https://github.com/egmaminta/attnhut/issues"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "attnhut/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["attnhut"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
