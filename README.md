@@ -31,6 +31,7 @@ actually do and then take it from there.
 - [Mechanisms](#mechanisms)
 - [MiniMax Sparse Attention](#minimax-sparse-attention)
 - [Heavily Compressed and Compressed Sparse Attention](#heavily-compressed-and-compressed-sparse-attention)
+- [Causal-JEPA Attention](#causal-jepa-attention)
 - [DeepSeek Sparse Attention](#deepseek-sparse-attention)
 - [Delta Attention](#delta-attention)
 - [Differential Attention](#differential-attention)
@@ -71,6 +72,7 @@ uv sync
 | `MiniMaxSparseAttention` | top k block selection on GQA | [MiniMax, 2026](https://huggingface.co/blog/AtlasCloud-AI/minimax-goes-sparse) |
 | `CompressedSparseAttention` | light compression plus selection | [DeepSeek-AI, 2026](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/blob/main/DeepSeek_V4.pdf) |
 | `HeavilyCompressedAttention` | heavy KV compression | [DeepSeek-AI, 2026](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/blob/main/DeepSeek_V4.pdf) |
+| `CausalJEPAAttention` | object level masking with bidirectional attention | [Nam et al., 2026](https://arxiv.org/abs/2602.11389) |
 | `DeepSeekSparseAttention` | lightning indexer top k tokens | [DeepSeek-AI, 2025](https://github.com/deepseek-ai/DeepSeek-V3.2-Exp) |
 | `DeltaAttention` | correction for sliding window | [Willette et al., 2025](https://neurips.cc/virtual/2025/poster/118545) |
 | `DifferentialAttention` | two softmax maps subtracted | [Ye et al., 2025](https://proceedings.iclr.cc/paper_files/paper/2025/hash/00b67df24009747e8bbed4c2c6f9c825-Abstract-Conference.html) |
@@ -110,6 +112,29 @@ with overlap and then selects the top k entries with a lightning indexer.
 ```python
 HeavilyCompressedAttention(dim, num_heads, compression_rate=16, window=64)
 CompressedSparseAttention(dim, num_heads, compression_rate=4, top_k=16, window=64)
+```
+
+## Causal-JEPA Attention
+
+A world model predictor that learns how objects interact by hiding objects and
+asking attention to put them back. Object slots are laid out as a grid of time by
+objects and flattened into one sequence. A random set of objects is hidden across
+the history and the whole future is hidden, then a bidirectional transformer
+rebuilds every hidden slot from the visible ones. Each hidden slot starts as a
+learned mask token plus a temporal embedding plus a linear projection of that
+object at the first frame, which keeps its identity. Nothing encodes object
+order, so the predictor does not care how the slots are arranged.
+
+Input is (batch, history_frames, num_slots, dim) and the forward pass returns the
+full (batch, total_frames, num_slots, dim) grid along with the hidden object
+indices. Call `predict` to roll out the future from a fully visible history.
+
+```python
+from attnhut import CausalJEPAAttention, cjepa_masked_loss
+
+attn = CausalJEPAAttention(dim, num_heads, num_slots, history_frames, pred_frames=1)
+pred, masked = attn(slots)
+loss = cjepa_masked_loss(pred, target, masked, history_frames)
 ```
 
 ## DeepSeek Sparse Attention

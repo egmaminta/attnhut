@@ -9,6 +9,7 @@ Every mechanism is an nn.Module you build with plain ints and call on a
 """
 
 from .bigbird import BigBirdAttention
+from .cjepa import CausalJEPAAttention, cjepa_masked_loss
 from .compressed import CompressedSparseAttention, HeavilyCompressedAttention
 from .deepseek_sparse import (
     DeepSeekSparseAttention,
@@ -24,7 +25,7 @@ from .mqa import MultiQueryAttention
 from .slot import SlotAttention
 from .standard import StandardAttention
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "StandardAttention",
@@ -42,4 +43,6 @@ __all__ = [
     "DeltaAttention",
     "DifferentialAttention",
     "SlotAttention",
+    "CausalJEPAAttention",
+    "cjepa_masked_loss",
 ]
