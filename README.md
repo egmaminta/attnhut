@@ -267,3 +267,17 @@ MIT.
 Emmanuel G. Maminta (emmanuel.maminta@eee.upd.edu.ph, egmaminta@up.edu.ph),
 Ubiquitous Computing Laboratory, Artificial Intelligence Graduate Program,
 University of the Philippines, Diliman, Quezon City, Philippines.
+
+## How to cite
+
+If attnhut helped your research or project, please cite it.
+
+```bibtex
+@software{maminta2026attnhut,
+  author  = {Maminta, Emmanuel G.},
+  title   = {attnhut: A collection of Transformer Attention mechanisms in PyTorch},
+  year    = {2026},
+  url     = {https://github.com/egmaminta/attnhut},
+  version = {0.4.0},
+}
+```
