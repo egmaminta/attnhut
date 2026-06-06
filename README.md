@@ -278,6 +278,6 @@ If attnhut helped your research or project, please cite it.
   title   = {attnhut: A collection of Transformer Attention mechanisms in PyTorch},
   year    = {2026},
   url     = {https://github.com/egmaminta/attnhut},
-  version = {0.4.0},
+  version = {0.4.1},
 }
 ```

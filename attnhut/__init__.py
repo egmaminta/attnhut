@@ -25,7 +25,7 @@ from .mqa import MultiQueryAttention
 from .slot import SlotAttention
 from .standard import StandardAttention
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 __all__ = [
     "StandardAttention",
