@@ -69,7 +69,7 @@ uv sync
 
 | Module | Idea | Reference |
 |---|---|---|
-| `MiniMaxSparseAttention` | top k block selection on GQA | [MiniMax, 2026](https://huggingface.co/blog/AtlasCloud-AI/minimax-goes-sparse) |
+| `MiniMaxSparseAttention` | top k block selection on GQA | [MiniMax, 2026](https://github.com/MiniMax-AI/MSA) |
 | `CompressedSparseAttention` | light compression plus selection | [DeepSeek-AI, 2026](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/blob/main/DeepSeek_V4.pdf) |
 | `HeavilyCompressedAttention` | heavy KV compression | [DeepSeek-AI, 2026](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/blob/main/DeepSeek_V4.pdf) |
 | `CausalJEPAAttention` | object level masking with bidirectional attention | [Nam et al., 2026](https://arxiv.org/abs/2602.11389) |
@@ -85,21 +85,26 @@ uv sync
 
 ## MiniMax Sparse Attention
 
-A cheap index branch scores key blocks with a single shared index key and one
-index query per GQA group, max pools the token scores into block scores, and
-keeps the top k blocks per group. The main attention then runs over the selected
-blocks. Selection is block level.
+The selector behind MiniMax M3. A cheap index branch scores key blocks with a
+single shared index key and one index query per GQA group, max pools the token
+scores into block scores, and keeps the top k blocks per group. Each query always
+keeps its own local block. The main attention then runs over the selected blocks.
+Selection is block level. The deployed setting is block_size 128 and top_k 16. Both
+branches apply QK norm and partial RoPE through rope_dim (the paper uses head dim
+128 with rope_dim 64).
 
 ```python
 from attnhut import MiniMaxSparseAttention, msa_index_aux_loss
 
-attn = MiniMaxSparseAttention(dim, num_heads, num_kv_groups, block_size=64, top_k=8)
+attn = MiniMaxSparseAttention(dim, num_heads, num_kv_groups, block_size=128, top_k=16)
 out, aux = attn(x, return_aux=True)
 ```
 
 Hard top k is not differentiable, so the index projections get no gradient from
-the forward pass. Add `msa_index_aux_loss(aux["block_scores"], aux["attn_weights"],
-block_size, group_size)` to the loss to train the selector.
+the forward pass. Add `msa_index_aux_loss(aux["index_scores"], aux["attn_weights"],
+aux["keep"])` to the loss to train the selector. It is the paper KL loss, matching
+the index scores to the group averaged main attention over the selected tokens.
+The index branch input is detached, so this trains only the index projections.
 
 ## Heavily Compressed and Compressed Sparse Attention
 
@@ -278,6 +283,6 @@ If attnhut helped your research or project, please cite it.
   title   = {attnhut: A collection of Transformer Attention mechanisms in PyTorch},
   year    = {2026},
   url     = {https://github.com/egmaminta/attnhut},
-  version = {0.4.1},
+  version = {0.5.0},
 }
 ```

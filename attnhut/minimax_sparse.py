@@ -1,10 +1,16 @@
-"""MiniMax Sparse Attention (MiniMax M2/M3).
+"""MiniMax Sparse Attention (Lai et al., 2026).
 
-A cheap index branch scores key blocks with a single shared index key and one
-index query per GQA group, max-pools the token scores into block scores, and
-keeps the top-k blocks per group. The main attention then runs over the selected
-blocks only. Block-level selection is what separates it from the token-level
-DeepSeek indexer.
+A blockwise sparse attention on a GQA backbone, the selector behind MiniMax-M3.
+A lightweight index branch scores key blocks with a single shared index key and
+one index query per GQA group, max pools the token scores into block scores, and
+keeps the top-k blocks per group. The local block of each query is always kept.
+The main branch then runs exact attention over the selected blocks only. Per
+group block-level selection is what separates it from the token-level DeepSeek
+indexer.
+
+Both branches apply QK norm to their query and key and use partial RoPE, and the
+index branch input is detached from the backbone, so the auxiliary KL loss trains
+the index projections alone and never reaches the rest of the model.
 
 Masked-dense reference. The selection is exact, the speedup is not (that needs a
 block-gather kernel).
@@ -15,7 +21,25 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from .rope import apply_rope, build_rope_cache
-from .utils import causal_mask, neg_value, repeat_kv
+from .utils import causal_mask, neg_value, repeat_kv, rms_norm
+
+
+def _partial_rope(x: Tensor, cos: Tensor, sin: Tensor, rope_dim: int) -> Tensor:
+    """Rotate the first rope_dim channels and pass the rest through.
+
+    Args:
+        x: Tensor of shape (batch, heads, seq, channels).
+        cos: Cosine cache of shape (seq, rope_dim).
+        sin: Sine cache of shape (seq, rope_dim).
+        rope_dim: Number of leading channels that get rotated.
+
+    Returns:
+        Tensor of the same shape as x.
+    """
+    if rope_dim == x.shape[-1]:
+        return apply_rope(x, cos, sin)
+    rotated = apply_rope(x[..., :rope_dim], cos, sin)
+    return torch.cat([rotated, x[..., rope_dim:]], dim=-1)
 
 
 class MiniMaxSparseAttention(nn.Module):
@@ -26,9 +50,12 @@ class MiniMaxSparseAttention(nn.Module):
         num_heads: Number of query heads.
         num_kv_groups: Number of key/value groups. Must divide num_heads. Query
             heads in a group share one block selection.
-        block_size: Tokens per key block.
-        top_k: Blocks kept per query.
+        block_size: Tokens per key block. The paper deploys 128.
+        top_k: Blocks kept per query. The paper deploys 16.
         index_dim: Width of the index branch. Defaults to the head dim.
+        rope_dim: Channels that get RoPE in both branches, the rest pass through.
+            Defaults to min(head_dim, index_dim), a full rotation. The paper
+            deploys head_dim 128 with rope_dim 64.
         causal: If True, attention and selection are restricted to the past.
         use_rope: Apply rotary embeddings to the main and index projections.
         rope_theta: RoPE base frequency.
@@ -42,9 +69,10 @@ class MiniMaxSparseAttention(nn.Module):
         dim: int,
         num_heads: int,
         num_kv_groups: int,
-        block_size: int = 64,
-        top_k: int = 8,
+        block_size: int = 128,
+        top_k: int = 16,
         index_dim: int | None = None,
+        rope_dim: int | None = None,
         causal: bool = True,
         use_rope: bool = True,
         rope_theta: float = 10000.0,
@@ -65,16 +93,24 @@ class MiniMaxSparseAttention(nn.Module):
         self.use_rope = use_rope
         self.rope_theta = rope_theta
         self.force_current_block = force_current_block
-        if use_rope and (head_dim % 2 or self.index_dim % 2):
-            raise ValueError(
-                "head_dim and index_dim must be even when use_rope"
-            )
+        self.rope_dim = (
+            rope_dim if rope_dim is not None else min(head_dim, self.index_dim)
+        )
+        if use_rope:
+            if self.rope_dim % 2:
+                raise ValueError("rope_dim must be even")
+            if self.rope_dim > head_dim or self.rope_dim > self.index_dim:
+                raise ValueError("rope_dim cannot exceed head_dim or index_dim")
         kv = num_kv_groups * head_dim
         self.q = nn.Linear(dim, dim, bias=bias)
         self.k = nn.Linear(dim, kv, bias=bias)
         self.v = nn.Linear(dim, kv, bias=bias)
         self.idx_q = nn.Linear(dim, num_kv_groups * self.index_dim, bias=bias)
         self.idx_k = nn.Linear(dim, self.index_dim, bias=bias)
+        self.q_norm = nn.Parameter(torch.ones(head_dim))
+        self.k_norm = nn.Parameter(torch.ones(head_dim))
+        self.idx_q_norm = nn.Parameter(torch.ones(self.index_dim))
+        self.idx_k_norm = nn.Parameter(torch.ones(self.index_dim))
         self.proj = nn.Linear(dim, dim, bias=bias)
 
     def _select_blocks(self, qi: Tensor, ki: Tensor) -> tuple[Tensor, Tensor]:
@@ -85,10 +121,11 @@ class MiniMaxSparseAttention(nn.Module):
             ki: Shared index key of shape (batch, 1, seq, index_dim).
 
         Returns:
-            A pair (block_keep, block_scores), both of shape
-            (batch, groups, seq, num_blocks). block_keep is boolean. Causal
-            masking is applied to the token scores before pooling so a future
-            block can never win the max for an earlier query.
+            A pair (block_keep, scores). block_keep is boolean of shape
+            (batch, groups, seq, num_blocks). scores holds the token-level index
+            scores of shape (batch, groups, seq, seq), causally masked, used by
+            the aux loss. Causal masking is applied to the token scores before
+            pooling so a future block can never win the max for an earlier query.
         """
         b, h, t, _ = qi.shape
         bs, device = self.block_size, qi.device
@@ -101,10 +138,9 @@ class MiniMaxSparseAttention(nn.Module):
         if valid is not None:
             scores = scores.masked_fill(~valid, neg)
         pad = (-t) % bs
-        if pad:
-            scores = F.pad(scores, (0, pad), value=neg)
+        padded = F.pad(scores, (0, pad), value=neg) if pad else scores
         nb = (t + pad) // bs
-        block_scores = scores.view(b, h, t, nb, bs).amax(dim=-1)
+        block_scores = padded.view(b, h, t, nb, bs).amax(dim=-1)
 
         topi = block_scores.topk(max(1, min(self.top_k, nb)), dim=-1).indices
         keep = torch.zeros(b, h, t, nb, dtype=torch.bool, device=device)
@@ -115,7 +151,7 @@ class MiniMaxSparseAttention(nn.Module):
         if self.force_current_block:
             cur = (torch.arange(t, device=device) // bs).clamp_max(nb - 1)
             keep |= F.one_hot(cur, nb).bool().view(1, 1, t, nb)
-        return keep, block_scores
+        return keep, scores
 
     def forward(
         self, x: Tensor, return_aux: bool = False
@@ -124,38 +160,47 @@ class MiniMaxSparseAttention(nn.Module):
 
         Args:
             x: Input of shape (batch, seq, dim).
-            return_aux: If True, also return the index scores and attention
-                weights needed by msa_index_aux_loss.
+            return_aux: If True, also return the tensors needed by
+                msa_index_aux_loss.
 
         Returns:
             Output of shape (batch, seq, dim). If return_aux is True, a pair
-            (output, aux) where aux has block_scores (batch, groups, seq,
-            num_blocks) and attn_weights (batch, num_heads, seq, seq).
+            (output, aux) where aux has index_scores (batch, groups, seq, seq),
+            attn_weights (batch, num_heads, seq, seq), and keep, the boolean
+            per-group selected support of shape (batch, groups, seq, seq).
         """
         b, t, _ = x.shape
         h = self.num_kv_groups
         g = self.num_heads // h
-        d, di, bs = self.head_dim, self.index_dim, self.block_size
+        d, di = self.head_dim, self.index_dim
+        bs = self.block_size
         device = x.device
 
+        xd = x.detach()  # index branch is trained only by the aux loss
         q = self.q(x).view(b, t, self.num_heads, d).transpose(1, 2)
         k = self.k(x).view(b, t, h, d).transpose(1, 2)
         v = self.v(x).view(b, t, h, d).transpose(1, 2)
-        qi = self.idx_q(x).view(b, t, h, di).transpose(1, 2)
-        ki = self.idx_k(x).view(b, t, 1, di).transpose(1, 2)
+        qi = self.idx_q(xd).view(b, t, h, di).transpose(1, 2)
+        ki = self.idx_k(xd).view(b, t, 1, di).transpose(1, 2)
+        q = rms_norm(q, self.q_norm)  # QK norm on both branches
+        k = rms_norm(k, self.k_norm)
+        qi = rms_norm(qi, self.idx_q_norm)
+        ki = rms_norm(ki, self.idx_k_norm)
 
         if self.use_rope:
             pos = torch.arange(t, device=device)
-            cos, sin = build_rope_cache(pos, d, self.rope_theta, x.dtype)
-            cos_i, sin_i = build_rope_cache(pos, di, self.rope_theta, x.dtype)
-            q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
-            qi, ki = apply_rope(qi, cos_i, sin_i), apply_rope(ki, cos_i, sin_i)
+            rd = self.rope_dim
+            cos, sin = build_rope_cache(pos, rd, self.rope_theta, x.dtype)
+            q = _partial_rope(q, cos, sin, rd)
+            k = _partial_rope(k, cos, sin, rd)
+            qi = _partial_rope(qi, cos, sin, rd)
+            ki = _partial_rope(ki, cos, sin, rd)
 
-        block_keep, block_scores = self._select_blocks(qi, ki)
-        keep = block_keep.repeat_interleave(bs, dim=-1)[..., :t]
-        keep = keep.repeat_interleave(g, dim=1)
+        block_keep, index_scores = self._select_blocks(qi, ki)
+        keep_g = block_keep.repeat_interleave(bs, dim=-1)[..., :t]
         if self.causal:
-            keep = keep & causal_mask(t, t, device)
+            keep_g = keep_g & causal_mask(t, t, device)
+        keep = keep_g.repeat_interleave(g, dim=1)
 
         kr, vr = repeat_kv(k, g), repeat_kv(v, g)
         logits = torch.matmul(q, kr.transpose(-2, -1)) * d**-0.5
@@ -167,39 +212,47 @@ class MiniMaxSparseAttention(nn.Module):
         out = torch.matmul(attn, vr).transpose(1, 2).reshape(b, t, -1)
         out = self.proj(out)
         if return_aux:
-            return out, {"block_scores": block_scores, "attn_weights": attn}
+            aux = {
+                "index_scores": index_scores,
+                "attn_weights": attn,
+                "keep": keep_g,
+            }
+            return out, aux
         return out
 
 
 def msa_index_aux_loss(
-    block_scores: Tensor,
+    index_scores: Tensor,
     attn_weights: Tensor,
-    block_size: int,
-    group_size: int,
+    keep: Tensor,
+    eps: float = 1e-9,
 ) -> Tensor:
-    """Train the index branch to rank blocks by realized attention mass.
+    """Train the index branch to match the main branch on the selected tokens.
 
     Hard top-k is not differentiable, so without this the index projections get
-    no gradient. The target pools the main attention weights into per-block
-    mass, averages over the heads of each group, and the index scores are fit to
-    it with a cross entropy.
+    no gradient. This is the paper's KL alignment loss. For each query and group,
+    the teacher is the group-averaged main attention distribution over the
+    selected tokens, and the student is the index scores softmaxed over the same
+    tokens. The teacher is detached, so the loss updates only the index branch.
 
     Args:
-        block_scores: Index branch scores of shape (batch, groups, seq,
-            num_blocks), from the aux dict.
+        index_scores: Token-level index scores of shape (batch, groups, seq,
+            seq), from the aux dict.
         attn_weights: Main attention weights of shape (batch, num_heads, seq,
             seq), from the aux dict.
-        block_size: Tokens per block, must match the forward pass.
-        group_size: Query heads per group, num_heads // num_kv_groups.
+        keep: Boolean per-group selected support of shape (batch, groups, seq,
+            seq), from the aux dict.
+        eps: Floor on the teacher probabilities inside the log.
 
     Returns:
-        A scalar loss.
+        A scalar KL loss, averaged over query positions and groups.
     """
-    b, heads, t, k = attn_weights.shape
-    nb = block_scores.shape[-1]
-    mass = F.pad(attn_weights.detach(), (0, nb * block_size - k))
-    mass = mass.view(b, heads, t, nb, block_size).sum(-1)
-    mass = mass.view(b, heads // group_size, group_size, t, nb).mean(2)
-    target = mass / mass.sum(-1, keepdim=True).clamp_min(1e-9)
-    log_p = torch.log_softmax(block_scores.to(torch.float32), dim=-1)
-    return -(target * log_p).sum(-1).mean()
+    b, heads, t, _ = attn_weights.shape
+    groups = index_scores.shape[1]
+    g = heads // groups
+    teacher = attn_weights.detach().view(b, groups, g, t, t).mean(dim=2)
+    scores = index_scores.float().masked_fill(~keep, float("-inf"))
+    log_student = torch.log_softmax(scores, dim=-1)
+    kl = teacher * (torch.log(teacher.clamp_min(eps)) - log_student)
+    kl = kl.masked_fill(teacher <= 0, 0.0)
+    return kl.sum(dim=-1).mean()
